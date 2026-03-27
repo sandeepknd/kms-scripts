@@ -386,17 +386,24 @@ authenticate_vault() {
         echo "  Using provided token"
     elif [ -n "$VAULT_USERNAME" ] && [ -n "$VAULT_PASSWORD" ]; then
         echo "  Authenticating with userpass (user: $VAULT_USERNAME)..."
-        local ns_header=""
-        [ -n "$VAULT_NAMESPACE" ] && ns_header="--header X-Vault-Namespace: $VAULT_NAMESPACE"
 
         # Use temporary file to capture full curl output for debugging
         local tmp_response=$(mktemp)
         local http_code
 
-        http_code=$(curl -s -w "%{http_code}" -o "$tmp_response" --noproxy "*" $ns_header \
-            --request POST \
-            --data "{\"password\": \"$VAULT_PASSWORD\"}" \
-            "$VAULT_ADDR/v1/auth/userpass/login/$VAULT_USERNAME")
+        # Build curl command with conditional namespace header
+        if [ -n "$VAULT_NAMESPACE" ]; then
+            http_code=$(curl -s -w "%{http_code}" -o "$tmp_response" --noproxy "*" \
+                --header "X-Vault-Namespace: $VAULT_NAMESPACE" \
+                --request POST \
+                --data "{\"password\": \"$VAULT_PASSWORD\"}" \
+                "$VAULT_ADDR/v1/auth/userpass/login/$VAULT_USERNAME")
+        else
+            http_code=$(curl -s -w "%{http_code}" -o "$tmp_response" --noproxy "*" \
+                --request POST \
+                --data "{\"password\": \"$VAULT_PASSWORD\"}" \
+                "$VAULT_ADDR/v1/auth/userpass/login/$VAULT_USERNAME")
+        fi
 
         if [ "$http_code" = "200" ]; then
             VAULT_TOKEN=$(jq -r '.auth.client_token' "$tmp_response" 2>/dev/null)
