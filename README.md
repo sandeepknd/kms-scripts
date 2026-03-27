@@ -1,33 +1,343 @@
-# KMS Plugin Deployment Script - Command Reference
+# KMS Plugin Deployment Script - Documentation
 
-This document lists all commands executed by `deploy-kms-plugin.sh` for both **Cloud Vault** and **Local Vault** deployment modes.
+This document provides a comprehensive guide for deploying the KMS (Key Management Service) plugin with HashiCorp Vault on OpenShift.
 
 ## Table of Contents
+
+### Part 1: Script Usage Guide
 - [Overview](#overview)
 - [Prerequisites](#prerequisites)
-- [Common Commands](#common-commands-both-modes)
+- [Script Modes](#script-modes)
+- [Command-Line Options](#command-line-options)
+- [Usage Examples](#usage-examples)
+- [Environment Variables](#environment-variables)
+- [Quick Start](#quick-start)
+
+### Part 2: Manual Command Reference
+- [Common Commands (Both Modes)](#common-commands-both-modes)
 - [Local Mode Commands](#local-mode-commands---local)
 - [Cloud Mode Commands](#cloud-mode-commands---cloud)
 - [Deployment Type Variations](#deployment-type-variations)
 - [Post-Deployment Commands](#post-deployment-commands)
+- [Command Execution Flow](#command-summary-by-execution-order)
+- [Troubleshooting](#troubleshooting-commands)
 
 ---
 
+# Part 1: Script Usage Guide
+
 ## Overview
 
-The script supports two modes:
-- **`--local`**: Installs Vault locally using Helm and configures KMS plugin (default: static-pod deployment)
-- **`--cloud`**: Uses existing cloud/external Vault instance (default: daemonset deployment)
+The `deploy-kms-plugin.sh` script automates the deployment of a KMS plugin for OpenShift that integrates with HashiCorp Vault for etcd encryption at rest.
+
+### Supported Modes
+
+The script supports two deployment modes:
+
+| Mode | Description | Default Deployment Type | Use Case |
+|------|-------------|------------------------|----------|
+| **`--local`** | Installs Vault locally using Helm | Static Pod | Development, testing, or isolated environments |
+| **`--cloud`** | Uses existing cloud/external Vault | DaemonSet | Production with HashiCorp Cloud Platform (HCP) or self-hosted Vault |
+
+### Deployment Types
 
 Both modes support two deployment types:
-- **`--static-pod`**: Deploys KMS plugin directly to control plane nodes
-- **`--daemonset`**: Deploys KMS plugin as a DaemonSet
+
+| Type | Description | Pros | Cons |
+|------|-------------|------|------|
+| **`--static-pod`** | Deploys KMS plugin directly to control plane nodes via static pod manifests | No dependency on kube-apiserver, survives cluster issues | Manual node-by-node deployment |
+| **`--daemonset`** | Deploys KMS plugin as a DaemonSet | Easier management, automatic scaling | Requires functional kube-apiserver |
 
 ---
 
 ## Prerequisites
 
-### Required Tools Check
+### Required Tools
+
+The script requires the following tools to be installed:
+
+```bash
+# OpenShift CLI
+oc version
+
+# JSON processor
+jq --version
+
+# HTTP client
+curl --version
+
+# Helm (required for --local mode only)
+helm version
+```
+
+### Required Access
+
+- OpenShift cluster admin access
+- For cloud mode: Access to existing Vault instance with admin credentials
+- For local mode: Cluster storage provisioner (for persistent Vault storage)
+
+### Required Files
+
+Ensure these files exist in the same directory as the script:
+- `namespace.yaml` - KMS plugin namespace definition
+- `serviceaccount.yaml` - Service account for DaemonSet deployment
+- `daemonset.yaml` - DaemonSet deployment manifest
+
+---
+
+## Script Modes
+
+### Local Mode (`--local`)
+
+Automatically installs and configures Vault in your OpenShift cluster.
+
+**What it does:**
+1. Installs HashiCorp Vault using Helm chart
+2. Deploys Vault to control plane nodes
+3. Initializes and unseals Vault
+4. Stores Vault keys in OpenShift secrets
+5. Configures Transit encryption engine
+6. Sets up AppRole authentication
+7. Deploys KMS plugin
+
+**Default configuration:**
+- Namespace: `vault-system`
+- Image: `docker.io/hashicorp/vault:1.15.4`
+- Storage: 2Gi persistent volume
+- Deployment: Static pod
+
+### Cloud Mode (`--cloud`)
+
+Connects to an existing Vault instance (HCP or self-hosted).
+
+**What it does:**
+1. Validates connectivity to Vault
+2. Authenticates using token or username/password
+3. Configures Transit encryption engine
+4. Sets up AppRole authentication
+5. Deploys KMS plugin
+
+**Supported Vault types:**
+- HashiCorp Cloud Platform (HCP)
+- Self-hosted Vault Enterprise
+- Self-hosted Vault Community Edition
+
+---
+
+## Command-Line Options
+
+### Mode Selection (Required)
+
+```bash
+--cloud          # Use existing cloud/external Vault
+--local          # Install Vault locally using Helm
+```
+
+### Deployment Type (Optional)
+
+```bash
+--static-pod     # Deploy KMS plugin as static pod on control plane nodes
+--daemonset      # Deploy KMS plugin as DaemonSet
+```
+
+If not specified:
+- `--local` defaults to `--static-pod`
+- `--cloud` prompts for selection (default: `--daemonset`)
+
+### Cloud Mode Options
+
+```bash
+--vault-addr <url>              # Vault server address (e.g., https://vault.example.com:8200)
+--vault-namespace <namespace>   # Vault namespace (for Enterprise/HCP)
+--token <token>                 # Vault authentication token
+--username <user>               # Vault username (for userpass auth)
+--password <pass>               # Vault password (for userpass auth)
+--skip-tls-verify               # Skip TLS certificate verification (insecure)
+```
+
+### Help
+
+```bash
+--help, -h      # Display help message
+```
+
+---
+
+## Usage Examples
+
+### Example 1: Local Vault with Static Pod (Quickest for testing)
+
+```bash
+./deploy-kms-plugin.sh --local
+```
+
+**Interactive prompts:**
+- Enable KMS FeatureGate? [Y/n]
+- Enable KMS encryption on etcd now? [y/N]
+
+### Example 2: Cloud Vault with DaemonSet
+
+```bash
+./deploy-kms-plugin.sh --cloud \
+  --vault-addr "https://vault-cluster-public.hashicorp.cloud:8200" \
+  --vault-namespace "admin" \
+  --username "admin-user" \
+  --password "your-password"
+```
+
+### Example 3: Cloud Vault with Static Pod (HCP)
+
+```bash
+./deploy-kms-plugin.sh --cloud --static-pod \
+  --vault-addr "https://vault-cluster-public.hashicorp.cloud:8200" \
+  --vault-namespace "admin" \
+  --token "hvs.CAESIxxx..."
+```
+
+### Example 4: Local Vault with DaemonSet
+
+```bash
+./deploy-kms-plugin.sh --local --daemonset
+```
+
+### Example 5: Using Environment Variables
+
+```bash
+export VAULT_ADDR="https://vault.example.com:8200"
+export VAULT_NAMESPACE="admin"
+export VAULT_USERNAME="admin-user"
+export VAULT_PASSWORD="password"
+
+./deploy-kms-plugin.sh --cloud
+```
+
+### Example 6: Using Private Container Image
+
+```bash
+export QUAY_USERNAME="robot-account+kms"
+export QUAY_PASSWORD="your-robot-token"
+
+./deploy-kms-plugin.sh --local
+```
+
+### Example 7: Skip TLS Verification (Testing only)
+
+```bash
+./deploy-kms-plugin.sh --cloud --skip-tls-verify \
+  --vault-addr "https://vault-dev.internal:8200" \
+  --token "hvs.xxx"
+```
+
+---
+
+## Environment Variables
+
+The script supports the following environment variables:
+
+| Variable | Description | Used in Mode |
+|----------|-------------|--------------|
+| `VAULT_ADDR` | Vault server address | Cloud |
+| `VAULT_NAMESPACE` | Vault namespace | Cloud |
+| `VAULT_TOKEN` | Vault authentication token | Cloud |
+| `VAULT_USERNAME` | Vault username | Cloud |
+| `VAULT_PASSWORD` | Vault password | Cloud |
+| `QUAY_USERNAME` | Quay.io registry username | Both |
+| `QUAY_PASSWORD` | Quay.io registry password/token | Both |
+
+**Priority:** Command-line options override environment variables.
+
+---
+
+## Quick Start
+
+### For Development/Testing (Local Vault)
+
+```bash
+# 1. Ensure prerequisites are installed
+oc version && jq --version && helm version
+
+# 2. Run the script
+./deploy-kms-plugin.sh --local
+
+# 3. Answer prompts
+#    - Enable KMS FeatureGate? Y
+#    - Enable KMS encryption on etcd now? Y
+
+# 4. Wait for deployment (10-20 minutes)
+
+# 5. Verify
+oc get pods -n openshift-kms-plugin
+oc get pods -n vault-system
+```
+
+### For Production (Cloud Vault / HCP)
+
+```bash
+# 1. Gather Vault information from HCP console
+#    - Public Address (e.g., https://vault-xxx.hashicorp.cloud:8200)
+#    - Namespace (usually "admin")
+#    - Admin credentials
+
+# 2. Run the script
+./deploy-kms-plugin.sh --cloud \
+  --vault-addr "https://your-vault.hashicorp.cloud:8200" \
+  --vault-namespace "admin" \
+  --username "admin" \
+  --password "your-password"
+
+# 3. Choose deployment type when prompted
+#    - Enter choice [1/2] (default: 1): 1  # for DaemonSet
+
+# 4. Answer prompts
+#    - Enable KMS FeatureGate? Y
+#    - Enable KMS encryption on etcd now? Y
+
+# 5. Wait for deployment (10-20 minutes)
+
+# 6. Verify
+oc get pods -n openshift-kms-plugin
+oc get clusteroperator kube-apiserver
+```
+
+---
+
+## Important Notes
+
+### FeatureGate Warning
+- Setting `featureSet=CustomNoUpgrade` prevents minor version upgrades
+- This is required for KMS encryption support
+- Plan your upgrade strategy accordingly
+
+### Rollout Time
+- kube-apiserver rollout takes 10-20 minutes
+- Each control plane node is updated sequentially
+- Cluster remains available during rollout
+
+### Static Pod Behavior
+- Static pods appear with node name suffix (e.g., `vault-kube-kms-master-0`)
+- Manifests are stored at `/etc/kubernetes/manifests/` on each node
+- kubelet automatically manages static pod lifecycle
+
+### Image Pull Considerations
+- For private images with static pods, global pull secret must be updated
+- Nodes may take 2-5 minutes to pick up new credentials
+- Consider using public images for simpler deployment
+
+### Vault Addresses
+- **Local mode**: KMS plugin uses internal cluster IP `http://<vault-svc-ip>:8200`
+- **Cloud mode**: KMS plugin uses external Vault address
+
+---
+
+# Part 2: Manual Command Reference
+
+This section lists all commands executed by the script for both modes and deployment types. Use this for manual deployment or troubleshooting.
+
+---
+
+## Prerequisites Check
+
+### Required Tools Verification
 ```bash
 command -v oc >/dev/null 2>&1 || { echo "Error: oc is required"; exit 1; }
 command -v jq >/dev/null 2>&1 || { echo "Error: jq is required"; exit 1; }
@@ -479,54 +789,11 @@ oc get nodes -l node-role.kubernetes.io/master
 
 ---
 
-## Usage Examples
-
-### Example 1: Cloud Vault with DaemonSet (Default)
-```bash
-./deploy-st-new.sh --cloud \
-  --vault-addr "https://your-vault.hashicorp.cloud:8200" \
-  --vault-namespace "admin" \
-  --username "admin-user" \
-  --password "your-password"
-```
-
-### Example 2: Cloud Vault with Static Pod
-```bash
-./deploy-st-new.sh --cloud --static-pod \
-  --vault-addr "https://your-vault.hashicorp.cloud:8200" \
-  --vault-namespace "admin" \
-  --token "hvs.xxx"
-```
-
-### Example 3: Local Vault with Static Pod (Default)
-```bash
-./deploy-st-new.sh --local
-```
-
-### Example 4: Local Vault with DaemonSet
-```bash
-./deploy-st-new.sh --local --daemonset
-```
-
-### Example 5: Using Environment Variables
-```bash
-export VAULT_ADDR="https://vault.example.com:8200"
-export VAULT_NAMESPACE="admin"
-export VAULT_USERNAME="admin-user"
-export VAULT_PASSWORD="password"
-./deploy-st-new.sh --cloud
-```
-
-### Example 6: Using Private Quay Image
-```bash
-export QUAY_USERNAME="your-robot-account+name"
-export QUAY_PASSWORD="your-robot-token"
-./deploy-st-new.sh --local
-```
-
 ---
 
 ## Command Summary by Execution Order
+
+This section provides a high-level overview of the command execution sequence for both modes.
 
 ### Local Mode Flow
 1. Check prerequisites (oc, jq, curl, helm)
@@ -554,17 +821,6 @@ export QUAY_PASSWORD="your-robot-token"
 7. Enable KMS FeatureGate
 8. Deploy KMS plugin (daemonset or static-pod)
 9. Enable KMS encryption on etcd
-
----
-
-## Notes
-
-- **FeatureGate Warning**: Setting `featureSet=CustomNoUpgrade` prevents minor version upgrades
-- **Static Pod Deployment**: Static pods appear with node name suffix (e.g., `vault-kube-kms-master-0`)
-- **Image Pull Issues**: If using private images, nodes may need to restart to pick up new pull secrets (2-5 minutes)
-- **Rollout Time**: kube-apiserver rollout can take 10-20 minutes as each control plane node is updated sequentially
-- **Vault Internal Address**: For local mode, KMS plugin uses internal cluster IP: `http://<vault-service-ip>:8200`
-- **Vault External Address**: For cloud mode, KMS plugin uses provided external Vault address
 
 ---
 
@@ -601,3 +857,56 @@ oc get nodes
 oc get mcp
 oc debug node/<node-name>
 ```
+
+---
+
+## Additional Resources
+
+### Related Documentation
+- [HashiCorp Vault Documentation](https://www.vaultproject.io/docs)
+- [OpenShift KMS Encryption](https://docs.openshift.com/container-platform/latest/security/encrypting-etcd.html)
+- [Vault Transit Secrets Engine](https://www.vaultproject.io/docs/secrets/transit)
+- [Vault AppRole Authentication](https://www.vaultproject.io/docs/auth/approle)
+
+### Common Issues and Solutions
+
+**Issue: DNS resolution fails for HCP Vault**
+```bash
+# Verify the Vault address is correct
+# Check HCP console: https://portal.cloud.hashicorp.com/
+# Ensure cluster is running and get the correct Public Address
+```
+
+**Issue: Static pods not appearing**
+```bash
+# Static pods take 30-60 seconds to appear
+# Check kubelet logs on the control plane node
+oc debug node/<node-name> -- chroot /host journalctl -u kubelet -f
+```
+
+**Issue: Image pull errors with private images**
+```bash
+# For static pods, global pull secret must be updated
+# Nodes need 2-5 minutes to pick up new credentials
+# Manually restart kubelet if needed
+oc debug node/<node-name> -- chroot /host systemctl restart kubelet
+```
+
+**Issue: Vault is sealed after restart**
+```bash
+# Unseal Vault using stored key
+UNSEAL_KEY=$(oc get secret vault-init-keys -n vault-system -o jsonpath='{.data.unseal-key}' | base64 -d)
+oc exec -n vault-system vault-0 -- vault operator unseal "$UNSEAL_KEY"
+```
+
+---
+
+## Summary
+
+This documentation covers:
+
+1. **Part 1: Script Usage Guide** - How to run `deploy-kms-plugin.sh` with various options and configurations
+2. **Part 2: Manual Command Reference** - Detailed list of all commands executed for manual deployment or troubleshooting
+
+For quick deployment, see the [Quick Start](#quick-start) section.
+For step-by-step manual deployment, refer to [Part 2: Manual Command Reference](#part-2-manual-command-reference).
