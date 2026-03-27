@@ -1,6 +1,6 @@
 # KMS Plugin Deployment Script - Command Reference
 
-This document lists all commands executed by `deploy-st-new.sh` for both **Cloud Vault** and **Local Vault** deployment modes.
+This document lists all commands executed by `deploy-kms-plugin.sh` for both **Cloud Vault** and **Local Vault** deployment modes.
 
 ## Table of Contents
 - [Overview](#overview)
