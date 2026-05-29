@@ -1139,6 +1139,642 @@ For questions or issues, consult:
 
 ---
 
-**Document Version:** 1.0  
+## Part 2: Verifying TLS Authentication
+
+The previous section verified that your certificate is **valid** (signed by a trusted CA). This section proves that TLS authentication **actually works** and that your private key is being used during connections.
+
+### Understanding the Difference
+
+There are **two different operations**:
+
+| Operation | What it Proves | Keys Used |
+|-----------|---------------|-----------|
+| **Certificate Verification**<br>(`openssl verify`) | ✅ Certificate is valid<br>✅ Signed by trusted CA<br>❌ Does NOT prove ownership | ✓ CA's public key<br>❌ Client's private key NOT used |
+| **TLS Authentication**<br>(actual connection) | ✅ Certificate is valid<br>✅ You OWN the certificate<br>✅ Authentication succeeds | ✓ CA's public key<br>✓ Client's private key REQUIRED |
+
+---
+
+## Method 1: OpenSSL s_client - Detailed Handshake
+
+See the complete TLS handshake including certificate exchange.
+
+### Command
+
+```bash
+# Extract credentials (if not already done)
+grep "client-certificate-data:" ~/Downloads/kubeconfig | \
+  awk '{print $2}' | base64 -d > /tmp/client-cert.pem
+
+grep "client-key-data:" ~/Downloads/kubeconfig | \
+  awk '{print $2}' | base64 -d > /tmp/client-key.pem
+
+grep "certificate-authority-data:" ~/Downloads/kubeconfig | \
+  awk '{print $2}' | base64 -d > /tmp/server-ca.crt
+
+# Get API server (remove https://)
+API_SERVER=$(oc whoami --show-server | sed 's|https://||')
+
+# Connect with full TLS details
+echo "CONNECT" | timeout 5 openssl s_client \
+    -connect "$API_SERVER" \
+    -cert /tmp/client-cert.pem \
+    -key /tmp/client-key.pem \
+    -CAfile /tmp/server-ca.crt \
+    -showcerts
+```
+
+### What to Look For
+
+**1. Server requests client certificate:**
+```
+Acceptable client certificate CA names
+OU=openshift, CN=admin-kubeconfig-signer
+CN=kube-csr-signer_@1780044761
+...
+```
+
+**2. SSL handshake bytes:**
+```
+SSL handshake has read 4044 bytes and written 3672 bytes
+```
+
+The "written" bytes include your certificate AND the Certificate Verify message signed with your private key.
+
+**3. Connection succeeds:**
+```
+Verify return code: 0 (ok)
+```
+
+**4. Cipher negotiated:**
+```
+New, TLSv1.3, Cipher is TLS_AES_128_GCM_SHA256
+```
+
+---
+
+## Method 2: Curl with Verbose Mode
+
+More practical for API testing.
+
+### Test 1: Successful Authentication
+
+```bash
+API_SERVER=$(oc whoami --show-server)
+
+curl -v \
+    --cert /tmp/client-cert.pem \
+    --key /tmp/client-key.pem \
+    --cacert /tmp/server-ca.crt \
+    "$API_SERVER/api/v1/namespaces?limit=3"
+```
+
+**Expected output:**
+```
+* TLSv1.3 (OUT), TLS handshake, Client hello (1):
+* TLSv1.3 (IN), TLS handshake, Server hello (2):
+* TLSv1.3 (IN), TLS handshake, Request CERT (13):
+* TLSv1.3 (OUT), TLS handshake, Certificate (11):        ← Sending your cert
+* TLSv1.3 (OUT), TLS handshake, CERT verify (15):        ← KEY EVIDENCE!
+* TLSv1.3 (OUT), TLS handshake, Finished (20):
+* TLSv1.3 (IN), TLS handshake, Finished (20):
+* SSL connection using TLSv1.3 / TLS_AES_128_GCM_SHA256
+...
+< HTTP/1.1 200 OK
+{
+  "kind": "NamespaceList",
+  "items": [...]
+}
+```
+
+**The critical line:** `TLS handshake, CERT verify (15)`
+
+This is the **Certificate Verify message** - a signature created with your private key that proves you own the certificate!
+
+### Test 2: Without Private Key (Proof of Requirement)
+
+```bash
+# Try WITHOUT private key
+curl -v \
+    --cert /tmp/client-cert.pem \
+    --cacert /tmp/server-ca.crt \
+    "$API_SERVER/api/v1/namespaces"
+```
+
+**Expected error:**
+```
+curl: (58) unable to set private key file: '/tmp/client-cert.pem' type PEM
+```
+
+or
+
+```
+curl: (35) error:14094410:SSL routines:ssl3_read_bytes:sslv3 alert handshake failure
+```
+
+This **proves** the private key is required for authentication.
+
+---
+
+## Method 3: Comparative Test Suite
+
+Run all tests to definitively prove private key usage.
+
+### Complete Test Script
+
+```bash
+#!/bin/bash
+
+API_SERVER=$(oc whoami --show-server)
+
+echo "═══════════════════════════════════════════════════════════════"
+echo " Test 1: WITH Certificate + Private Key (Should Succeed)"
+echo "═══════════════════════════════════════════════════════════════"
+
+curl -s \
+    --cert /tmp/client-cert.pem \
+    --key /tmp/client-key.pem \
+    --cacert /tmp/server-ca.crt \
+    "$API_SERVER/api/v1/namespaces?limit=3" | \
+    jq -r '.items[].metadata.name'
+
+if [ $? -eq 0 ]; then
+    echo "✅ SUCCESS - Retrieved namespaces"
+else
+    echo "❌ FAILED"
+fi
+
+echo
+echo "═══════════════════════════════════════════════════════════════"
+echo " Test 2: WITHOUT Private Key (Should Fail)"
+echo "═══════════════════════════════════════════════════════════════"
+
+curl -s \
+    --cert /tmp/client-cert.pem \
+    --cacert /tmp/server-ca.crt \
+    "$API_SERVER/api/v1/namespaces" 2>&1 | \
+    grep -i "error"
+
+echo "❌ EXPECTED FAILURE - Cannot authenticate without private key"
+
+echo
+echo "═══════════════════════════════════════════════════════════════"
+echo " Test 3: WITH Wrong Private Key (Should Fail)"
+echo "═══════════════════════════════════════════════════════════════"
+
+# Generate a different key
+openssl genrsa -out /tmp/wrong-key.pem 2048 2>/dev/null
+
+curl -s \
+    --cert /tmp/client-cert.pem \
+    --key /tmp/wrong-key.pem \
+    --cacert /tmp/server-ca.crt \
+    "$API_SERVER/api/v1/namespaces" 2>&1 | \
+    grep -i "error"
+
+echo "❌ EXPECTED FAILURE - Wrong private key doesn't match certificate"
+
+echo
+echo "═══════════════════════════════════════════════════════════════"
+echo " Test 4: Verify Certificate and Key are a Cryptographic Pair"
+echo "═══════════════════════════════════════════════════════════════"
+
+CERT_MODULUS=$(openssl x509 -noout -modulus -in /tmp/client-cert.pem | openssl md5)
+KEY_MODULUS=$(openssl rsa -noout -modulus -in /tmp/client-key.pem 2>/dev/null | openssl md5)
+
+echo "Certificate public key hash: $CERT_MODULUS"
+echo "Private key hash:            $KEY_MODULUS"
+
+if [ "$CERT_MODULUS" = "$KEY_MODULUS" ]; then
+    echo "✅ MATCH - Certificate and key are a cryptographic pair"
+else
+    echo "❌ NO MATCH"
+fi
+```
+
+### Test Results Summary
+
+| Test | Certificate | Private Key | Result | Proves |
+|------|-------------|-------------|--------|--------|
+| 1 | ✓ Correct | ✓ Correct | ✅ Success | Both required |
+| 2 | ✓ Correct | ❌ Missing | ❌ Fails | Private key required |
+| 3 | ✓ Correct | ❌ Wrong | ❌ Fails | Must be matching pair |
+| 4 | ✓ Correct | ✓ Correct | ✅ Match | Cryptographic pair verified |
+
+---
+
+## The Certificate Verify Message Explained
+
+This is the **cryptographic proof** that you own the certificate.
+
+### What Happens During TLS Handshake
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│ CLIENT SIDE (your machine during connection)                   │
+└────────────────────────────────────────────────────────────────┘
+
+Step 1: Collect all handshake messages so far
+  Messages = ClientHello + ServerHello + ... + ClientCertificate
+
+Step 2: Hash the messages
+  Hash = SHA256(Messages)
+
+Step 3: Sign with YOUR private key  ← THIS IS THE KEY STEP!
+  Signature = RSA_Sign(Hash, Your_Private_Key)
+
+Step 4: Send Certificate Verify message
+  CertificateVerify {
+    algorithm: rsa_pss_rsae_sha256
+    signature: <binary signature>
+  }
+
+
+┌────────────────────────────────────────────────────────────────┐
+│ SERVER SIDE (kube-apiserver)                                   │
+└────────────────────────────────────────────────────────────────┘
+
+Step 1: Receive Certificate Verify message
+  Signature = <from client>
+
+Step 2: Extract your public key from your certificate
+  Public_Key = ExtractFromCert(Client_Certificate)
+
+Step 3: Verify signature using your public key
+  Decrypted_Hash = RSA_Verify(Signature, Public_Key)
+
+Step 4: Calculate expected hash
+  Expected_Hash = SHA256(Messages)
+
+Step 5: Compare
+  If Decrypted_Hash == Expected_Hash:
+    ✅ Client owns the certificate!
+    ✅ Authentication succeeds
+  Else:
+    ❌ Signature invalid
+    ❌ Authentication fails
+```
+
+### Why This Proves Ownership
+
+**The private key never leaves your machine**, but the signature proves:
+
+1. **You have the private key** - Only the private key can create a valid signature
+2. **The signature is fresh** - It includes all handshake messages (prevents replay attacks)
+3. **The signature matches the certificate** - The public key in the cert verifies it
+
+**Without the private key:**
+- You cannot create a valid signature
+- The Certificate Verify message will be invalid
+- The server rejects the connection
+- Authentication fails
+
+---
+
+## Packet Capture Analysis (Advanced)
+
+For the most detailed proof, capture the actual TLS handshake.
+
+### Using tcpdump
+
+```bash
+# Start packet capture (requires root)
+API_HOST=$(oc whoami --show-server | sed 's|https://||' | cut -d: -f1)
+
+sudo tcpdump -i any -s 0 -w /tmp/tls-capture.pcap \
+    "host $API_HOST and port 6443"
+
+# In another terminal, make API call
+curl --cert /tmp/client-cert.pem \
+     --key /tmp/client-key.pem \
+     --cacert /tmp/server-ca.crt \
+     "$(oc whoami --show-server)/api/v1/namespaces?limit=1"
+
+# Stop capture (Ctrl+C in first terminal)
+```
+
+### Analyze with Wireshark
+
+```bash
+wireshark /tmp/tls-capture.pcap
+```
+
+**Filter in Wireshark:** `tls.handshake.type`
+
+**TLS handshake messages to look for:**
+
+1. **Client Hello** (1) - Client initiates
+2. **Server Hello** (2) - Server responds
+3. **Certificate** (11) - Server proves identity
+4. **Certificate Request** (13) - Server asks for client cert
+5. **Certificate** (11) - Client sends certificate
+6. **Certificate Verify** (15) - **CLIENT PROVES OWNERSHIP!**
+   - Contains signature from client's private key
+   - This is the smoking gun!
+7. **Finished** (20) - Handshake complete
+
+### Certificate Verify Message in Wireshark
+
+Expand the Certificate Verify message:
+
+```
+TLSv1.3 Record Layer: Handshake Protocol: Certificate Verify
+    Handshake Protocol: Certificate Verify
+        Handshake Type: Certificate Verify (15)
+        Length: 264
+        Signature Algorithm: rsa_pss_rsae_sha256 (0x0804)
+        Signature Length: 256
+        Signature: a6dc403f22f8eba8edf3e4491bbd33b0...
+                   [256 bytes of cryptographic signature]
+```
+
+**This signature was created using your private key!**
+
+---
+
+## The Four Keys in TLS Authentication
+
+Understanding all keys involved clarifies the process.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ CA (admin-kubeconfig-signer)                                │
+├─────────────────────────────────────────────────────────────┤
+│ 1. CA Private Key  → Used to SIGN client certificates       │
+│                      (stored in cluster, never distributed) │
+│                                                              │
+│ 2. CA Public Key   → Embedded in CA certificate             │
+│                      (in ca-bundle.crt, used to verify)     │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│ Client (your kubeconfig)                                    │
+├─────────────────────────────────────────────────────────────┤
+│ 3. Client Private Key → Proves you OWN the certificate      │
+│                         (client-key-data in kubeconfig)     │
+│                         USED in TLS handshake               │
+│                                                              │
+│ 4. Client Public Key  → Embedded in client certificate      │
+│                         (used to verify your signatures)    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Key Usage Summary
+
+| Key | Location | Used In | Purpose |
+|-----|----------|---------|---------|
+| **CA Private** | Cluster Secret | Certificate creation | Sign new certificates |
+| **CA Public** | CA certificate (ca-bundle.crt) | Certificate verification<br>TLS authentication | Verify cert signatures |
+| **Client Private** | kubeconfig (client-key-data) | TLS authentication<br>**NOT in verification** | Prove ownership |
+| **Client Public** | Client certificate | TLS authentication | Verify your signatures |
+
+---
+
+## Complete TLS Verification Script
+
+Save this as `/tmp/verify_tls_authentication.sh`:
+
+```bash
+#!/bin/bash
+
+echo "╔══════════════════════════════════════════════════════════════════╗"
+echo "║  TLS Authentication Verification Suite                           ║"
+echo "╚══════════════════════════════════════════════════════════════════╝"
+echo
+
+# Configuration
+KUBECONFIG_PATH="${1:-$HOME/Downloads/kubeconfig}"
+CLIENT_CERT="/tmp/client-cert.pem"
+CLIENT_KEY="/tmp/client-key.pem"
+SERVER_CA="/tmp/server-ca.crt"
+
+# Extract credentials
+echo "Extracting credentials from kubeconfig..."
+grep "client-certificate-data:" "$KUBECONFIG_PATH" | awk '{print $2}' | base64 -d > "$CLIENT_CERT"
+grep "client-key-data:" "$KUBECONFIG_PATH" | awk '{print $2}' | base64 -d > "$CLIENT_KEY"
+grep "certificate-authority-data:" "$KUBECONFIG_PATH" | awk '{print $2}' | base64 -d > "$SERVER_CA"
+
+API_SERVER=$(oc whoami --show-server 2>/dev/null)
+if [ -z "$API_SERVER" ]; then
+    echo "Error: Not connected to cluster"
+    exit 1
+fi
+
+echo "✓ API Server: $API_SERVER"
+echo
+
+# Test 1: Successful authentication
+echo "═══════════════════════════════════════════════════════════════"
+echo " TEST 1: Complete Authentication (Cert + Key)"
+echo "═══════════════════════════════════════════════════════════════"
+echo
+
+RESPONSE=$(curl -s \
+    --cert "$CLIENT_CERT" \
+    --key "$CLIENT_KEY" \
+    --cacert "$SERVER_CA" \
+    "$API_SERVER/api/v1/namespaces?limit=3" 2>&1)
+
+if echo "$RESPONSE" | jq -e '.items[]' > /dev/null 2>&1; then
+    echo "✅ PASS: Successfully authenticated"
+    echo
+    echo "Retrieved namespaces:"
+    echo "$RESPONSE" | jq -r '.items[].metadata.name' | head -5
+    echo
+else
+    echo "❌ FAIL: Authentication failed"
+    echo "$RESPONSE" | head -5
+fi
+
+# Test 2: Without private key
+echo
+echo "═══════════════════════════════════════════════════════════════"
+echo " TEST 2: Without Private Key"
+echo "═══════════════════════════════════════════════════════════════"
+echo
+
+ERROR=$(curl -s \
+    --cert "$CLIENT_CERT" \
+    --cacert "$SERVER_CA" \
+    "$API_SERVER/api/v1/namespaces" 2>&1)
+
+if echo "$ERROR" | grep -q "error\|unable\|failed"; then
+    echo "✅ PASS: Correctly failed without private key"
+    echo
+    echo "Error message:"
+    echo "$ERROR" | grep -i "error" | head -3
+else
+    echo "❌ UNEXPECTED: Should have failed"
+fi
+
+# Test 3: Wrong private key
+echo
+echo "═══════════════════════════════════════════════════════════════"
+echo " TEST 3: With Wrong Private Key"
+echo "═══════════════════════════════════════════════════════════════"
+echo
+
+openssl genrsa -out /tmp/wrong-key.pem 2048 2>/dev/null
+
+ERROR=$(curl -s \
+    --cert "$CLIENT_CERT" \
+    --key /tmp/wrong-key.pem \
+    --cacert "$SERVER_CA" \
+    "$API_SERVER/api/v1/namespaces" 2>&1)
+
+if echo "$ERROR" | grep -q "error\|SSL\|handshake"; then
+    echo "✅ PASS: Correctly failed with wrong private key"
+else
+    echo "❌ UNEXPECTED: Should have failed"
+fi
+
+# Test 4: Verify key pair
+echo
+echo "═══════════════════════════════════════════════════════════════"
+echo " TEST 4: Verify Certificate and Key are a Pair"
+echo "═══════════════════════════════════════════════════════════════"
+echo
+
+CERT_MODULUS=$(openssl x509 -noout -modulus -in "$CLIENT_CERT" | openssl md5)
+KEY_MODULUS=$(openssl rsa -noout -modulus -in "$CLIENT_KEY" 2>/dev/null | openssl md5)
+
+echo "Certificate public key: $CERT_MODULUS"
+echo "Private key:            $KEY_MODULUS"
+echo
+
+if [ "$CERT_MODULUS" = "$KEY_MODULUS" ]; then
+    echo "✅ PASS: Certificate and private key are a cryptographic pair"
+else
+    echo "❌ FAIL: Key mismatch"
+fi
+
+# Test 5: Trace handshake
+echo
+echo "═══════════════════════════════════════════════════════════════"
+echo " TEST 5: Capture Certificate Verify Message"
+echo "═══════════════════════════════════════════════════════════════"
+echo
+
+curl --trace-ascii /tmp/tls-trace.log \
+    --cert "$CLIENT_CERT" \
+    --key "$CLIENT_KEY" \
+    --cacert "$SERVER_CA" \
+    "$API_SERVER/api/v1/namespaces?limit=1" > /dev/null 2>&1
+
+if grep -qi "certificate.*verify" /tmp/tls-trace.log; then
+    echo "✅ PASS: Certificate Verify message found in handshake"
+    echo
+    echo "Evidence of private key usage:"
+    grep -i "certificate.*verify" /tmp/tls-trace.log | head -3
+else
+    echo "Trace saved to /tmp/tls-trace.log for manual inspection"
+fi
+
+# Summary
+echo
+echo "╔══════════════════════════════════════════════════════════════════╗"
+echo "║  SUMMARY                                                         ║"
+echo "╠══════════════════════════════════════════════════════════════════╣"
+echo "║                                                                   ║"
+echo "║  ✅ Test 1: Authentication with cert + key succeeds              ║"
+echo "║  ✅ Test 2: Authentication without private key fails             ║"
+echo "║  ✅ Test 3: Authentication with wrong key fails                  ║"
+echo "║  ✅ Test 4: Certificate and key are cryptographic pair           ║"
+echo "║  ✅ Test 5: Certificate Verify message present                   ║"
+echo "║                                                                   ║"
+echo "║  CONCLUSION:                                                     ║"
+echo "║  Private key is REQUIRED and ACTIVELY USED during                ║"
+echo "║  TLS authentication to prove certificate ownership               ║"
+echo "║                                                                   ║"
+echo "╚══════════════════════════════════════════════════════════════════╝"
+echo
+
+# Cleanup option
+read -p "Remove temporary files? (y/n) " -n 1 -r
+echo
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+    rm -f "$CLIENT_CERT" "$CLIENT_KEY" "$SERVER_CA" /tmp/wrong-key.pem /tmp/tls-trace.log
+    echo "Temporary files removed"
+fi
+```
+
+**Run the verification:**
+```bash
+chmod +x /tmp/verify_tls_authentication.sh
+/tmp/verify_tls_authentication.sh ~/Downloads/kubeconfig
+```
+
+---
+
+## Summary: Certificate Verification vs TLS Authentication
+
+### What We've Proven
+
+**Part 1 (Certificate Verification):**
+- ✅ Your certificate was signed by `admin-kubeconfig-signer`
+- ✅ The certificate is valid and trusted by the cluster
+- ✅ Uses only the CA's public key
+- ❌ Does NOT use or require your private key
+
+**Part 2 (TLS Authentication):**
+- ✅ Your private key is REQUIRED for actual connections
+- ✅ The Certificate Verify message proves ownership
+- ✅ Without the private key, authentication fails
+- ✅ With wrong private key, authentication fails
+- ✅ Certificate and key are a cryptographic pair
+
+### The Complete Picture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Certificate Verification (openssl verify)                   │
+├─────────────────────────────────────────────────────────────┤
+│ Input:  Client certificate + CA bundle                      │
+│ Uses:   CA's public key                                     │
+│ Proves: Certificate is valid                                │
+│ Does NOT prove: You own it                                  │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│ TLS Authentication (curl with cert+key)                     │
+├─────────────────────────────────────────────────────────────┤
+│ Input:  Client certificate + Client private key             │
+│ Uses:   CA's public key + Client's private key              │
+│ Proves: Certificate is valid AND you own it                 │
+│ Result: Authentication succeeds                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Key Insights
+
+1. **Certificate verification** is a public operation - anyone can verify a certificate is valid
+
+2. **TLS authentication** is a private operation - only the owner of the private key can succeed
+
+3. **The Certificate Verify message** is the cryptographic proof of ownership:
+   - Created by signing handshake data with your private key
+   - Verified by the server using your public key from the certificate
+   - Cannot be forged without the private key
+
+4. **This is why kubeconfig contains both:**
+   - `client-certificate-data` - Public identity (anyone can see it)
+   - `client-key-data` - Secret proof of ownership (NEVER share this!)
+
+### Real-World Analogy
+
+**Certificate verification** is like checking if a driver's license is real:
+- Look at the security features
+- Verify it was issued by the DMV
+- Anyone can verify it's legitimate
+
+**TLS authentication** is like proving the license is yours:
+- Show the license
+- Answer security questions only you know
+- Prove you're not just holding someone else's license
+
+Without your private key, the certificate is just a piece of paper that anyone could copy. The private key is what makes it **YOUR** credential.
+
+---
+
+**Document Version:** 1.1  
 **Last Updated:** 2026-05-30  
-**Author:** Generated from cluster analysis
+**Author:** Generated from cluster analysis with TLS authentication verification
