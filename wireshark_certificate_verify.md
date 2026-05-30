@@ -152,6 +152,7 @@ Frame 5: TLSv1.3 Record Layer: Handshake Protocol: Certificate Verify
 **This signature is the proof that your private key was used!**
 
 ---
+<img width="1905" height="1066" alt="image" src="https://github.com/user-attachments/assets/6a53934d-3f34-49d4-b206-01281217ec7e" />
 
 ## Solution 2: Using curl --trace (No Wireshark Needed)
 
