@@ -2,142 +2,307 @@
 
 ## Overview
 
-This document provides manual testing procedures to verify the architectural improvements in PR #378 for non-blocking etcd defragmentation on an existing OpenShift cluster.
+This document provides manual testing procedures to verify the architectural improvements in PR #378 for non-blocking etcd defragmentation on an existing OpenShift cluster **using direct etcdctl commands**.
 
 **PR #378 Key Improvements:**
 - Reduces write blocking time from O(db_size) to O(concurrent_writes)
 - Implements three-phase defragmentation with write journaling
 - Maintains ~99%+ write availability during defragmentation
 
+**Testing Approach:**
+- Uses **direct etcdctl writes** to bypass API server overhead
+- Writes to `/test/` prefix in etcd (NOT Kubernetes resources)
+- Creates 3GB database to achieve realistic 10-30 second defrag times
+- Measures write success rate during defragmentation
+
 ---
 
 ## Table of Contents
 
 1. [Prerequisites](#prerequisites)
-2. [Manual Test 1: Write Availability During Defrag](#manual-test-1-write-availability-during-defrag)
-3. [Manual Test 2: Database Size Reduction](#manual-test-2-database-size-reduction)
-4. [Manual Test 3: Data Consistency Verification](#manual-test-3-data-consistency-verification)
-5. [Manual Test 4: Performance Impact Monitoring](#manual-test-4-performance-impact-monitoring)
-6. [Manual Test 5: Journal Activity Logs](#manual-test-5-journal-activity-logs)
-7. [Quick Start Test](#quick-start-simple-test)
-8. [Important Notes](#important-notes)
-9. [Summary Checklist](#summary-checklist)
+2. [Test Procedure Summary](#test-procedure-summary)
+3. [Detailed Test Steps](#detailed-test-steps)
+4. [Cleanup](#cleanup)
+5. [Expected Results](#expected-results)
+6. [Troubleshooting](#troubleshooting)
 
 ---
 
 ## Prerequisites
 
-### Step 1: Verify cluster access
+### Verify cluster access
 
 ```bash
 # Check cluster access
 oc whoami
 oc get nodes
 
-# Check if you have access to etcd namespace
-oc get pods -n openshift-etcd
-
 # Check etcd pods
 oc get pods -n openshift-etcd -l app=etcd
+
+# Get etcd pod name
+ETCD_POD=$(oc get pods -n openshift-etcd -l app=etcd -o name | head -1 | cut -d/ -f2)
+echo "Using etcd pod: $ETCD_POD"
 ```
 
-### Step 2: Identify control plane nodes
+### Check current database size
 
 ```bash
-# List control plane nodes
-oc get nodes -l node-role.kubernetes.io/master
+ETCD_POD=$(oc get pods -n openshift-etcd -l app=etcd -o name | head -1 | cut -d/ -f2)
 
-# Check etcd pod distribution
-oc get pods -n openshift-etcd -o wide | grep etcd-
+# Check database file size
+oc exec -n openshift-etcd $ETCD_POD -c etcd -- ls -lh /var/lib/etcd/member/snap/db
+
+# Check etcd status
+oc exec -n openshift-etcd $ETCD_POD -c etcd -- etcdctl endpoint status --write-out=table
 ```
-
-### Step 3: Check etcd version
-
-```bash
-# Get etcd version running in cluster
-oc exec -n openshift-etcd $(oc get pods -n openshift-etcd -l app=etcd -o name | head -1) -- etcd --version
-
-# Check the etcd image being used
-oc get pods -n openshift-etcd -o jsonpath='{.items[0].spec.containers[?(@.name=="etcd")].image}' | head -1
-```
-
-**Important:** If your cluster doesn't have PR #378 changes, you'll need to build and deploy a custom etcd image with these changes.
 
 ---
 
-## Manual Test 1: Write Availability During Defrag
+## Test Procedure Summary
 
-### Objective
-Verify that writes continue during defragmentation and measure write blocking time.
+The test consists of 4 main steps:
 
-### Expected Result
-- >95% write success rate during defrag
-- Only brief blocking during journal drain and switchover phases
-- Most writes succeed even during the copy phase
+1. **Setup**: Create 3GB database using `/tmp/create-large-etcd-db.sh`
+2. **Terminal 1**: Start continuous writes in background
+3. **Terminal 2**: Trigger defrag while writes are running
+4. **Terminal 1**: Stop writes and analyze success rate
 
-### Procedure
+All steps use **direct etcdctl commands** - no ConfigMaps, no API server overhead.
 
-#### Terminal 1 - Continuous Write Monitor
+---
+
+## Detailed Test Steps
+
+### Step 1: Create Large Database Setup Script
+
+Create the script that will populate etcd with 3GB of data:
 
 ```bash
-# Start continuous writes to etcd via Kubernetes API
-cat > /tmp/continuous-writes.sh << 'EOF'
+cat > /tmp/create-large-etcd-db.sh << 'EOF'
 #!/bin/bash
+
+ETCD_POD=$(oc get pods -n openshift-etcd -l app=etcd -o name | head -1 | cut -d/ -f2)
+
+# Configuration
+PAYLOAD_SIZE=524288   # 512KB per key (safer for argument limits)
+NUM_KEYS=6000         # Number of keys to create (6000 × 512KB = 3GB total)
+
+echo "========================================="
+echo "  Creating Large etcd Database for Testing"
+echo "========================================="
+echo ""
+
+echo "=== Configuration ==="
+echo "Payload size per key: $(numfmt --to=iec $PAYLOAD_SIZE 2>/dev/null || echo '512KB')"
+echo "Number of keys: $NUM_KEYS"
+echo "Total data to write: $(numfmt --to=iec $((NUM_KEYS * PAYLOAD_SIZE)) 2>/dev/null || echo '3GB')"
+echo "Start time: $(date +'%H:%M:%S')"
+echo ""
+
+echo "=== Current Database Size ==="
+oc exec -n openshift-etcd $ETCD_POD -c etcd -- ls -lh /var/lib/etcd/member/snap/db
+echo ""
+
+echo "=== Writing $NUM_KEYS × 512KB keys to etcd ==="
+echo "This will take several minutes..."
+
+oc exec -n openshift-etcd $ETCD_POD -c etcd -- sh -c "
+  for i in \$(seq 1 $NUM_KEYS); do
+    # Generate data and pipe directly to etcdctl (avoids argument length limit)
+    head -c $PAYLOAD_SIZE /dev/urandom | base64 -w 0 | etcdctl put /test/large-data-\$i >/dev/null
+
+    if [ \$((\$i % 600)) -eq 0 ]; then
+      echo \"  Written \$i / $NUM_KEYS keys... (\$(date +'%H:%M:%S'))\"
+    fi
+  done
+
+  echo \"All keys written!\"
+"
+
+echo "Completed at: $(date +'%H:%M:%S')"
+echo ""
+
+# Wait for etcd to flush
+echo "Waiting for etcd to flush writes..."
+sleep 10
+
+echo "=== New Database Size ==="
+oc exec -n openshift-etcd $ETCD_POD -c etcd -- ls -lh /var/lib/etcd/member/snap/db
+DB_SIZE=$(oc exec -n openshift-etcd $ETCD_POD -c etcd -- stat -c%s /var/lib/etcd/member/snap/db 2>/dev/null || echo 0)
+if [ $DB_SIZE -gt 0 ]; then
+  echo "Database size: $(numfmt --to=iec $DB_SIZE 2>/dev/null || echo "$DB_SIZE bytes")"
+fi
+echo ""
+
+# Verify data was written
+echo "=== Verifying Data ==="
+oc exec -n openshift-etcd $ETCD_POD -c etcd -- sh -c '
+  KEY_COUNT=$(etcdctl get /test/ --prefix --keys-only | wc -l)
+  echo "Total keys under /test/: $KEY_COUNT"
+
+  SAMPLE_SIZE=$(etcdctl get /test/large-data-1 --print-value-only 2>/dev/null | wc -c)
+  if [ $SAMPLE_SIZE -gt 0 ]; then
+    echo "Sample key size: $(numfmt --to=iec $SAMPLE_SIZE 2>/dev/null || echo "$SAMPLE_SIZE bytes")"
+  fi
+'
+
+echo ""
+echo "=== Creating Fragmentation ==="
+echo "Deleting 50% of keys to create space to reclaim..."
+
+DELETE_COUNT=$((NUM_KEYS / 2))
+oc exec -n openshift-etcd $ETCD_POD -c etcd -- sh -c "
+  for i in \$(seq 1 $DELETE_COUNT); do
+    etcdctl del /test/large-data-\$i >/dev/null
+
+    if [ \$((\$i % 600)) -eq 0 ]; then
+      echo \"  Deleted \$i / $DELETE_COUNT keys...\"
+    fi
+  done
+
+  echo \"Deletions complete!\"
+"
+
+sleep 5
+echo ""
+
+echo "=== Testing Defrag Duration ==="
+START=$(date +%s)
+oc exec -n openshift-etcd $ETCD_POD -c etcd -- etcdctl defrag
+END=$(date +%s)
+DURATION=$((END - START))
+
+echo ""
+echo "========================================="
+echo "  Setup Complete!"
+echo "========================================="
+echo ""
+echo "Results:"
+echo "  - Keys created: $NUM_KEYS"
+echo "  - Keys deleted (fragmentation): $DELETE_COUNT"
+echo "  - Keys remaining: $((NUM_KEYS - DELETE_COUNT))"
+echo "  - Defrag duration: ${DURATION} seconds"
+
+if [ $DURATION -lt 5 ]; then
+  echo "  ⚠ Defrag still fast (<5s) - consider increasing NUM_KEYS to 12000"
+elif [ $DURATION -lt 15 ]; then
+  echo "  ✓ Good defrag window (5-15s) for testing"
+  echo "    Expected write attempts during defrag: ~$((DURATION * 10))"
+elif [ $DURATION -lt 60 ]; then
+  echo "  ✓ Excellent defrag window (15-60s) for comprehensive testing"
+  echo "    Expected write attempts during defrag: ~$((DURATION * 10))"
+else
+  echo "  ✓ Very large defrag window (${DURATION}s) for thorough testing"
+  echo "    Expected write attempts during defrag: ~$((DURATION * 10))"
+fi
+
+echo ""
+echo "=== Final Database Size ==="
+oc exec -n openshift-etcd $ETCD_POD -c etcd -- ls -lh /var/lib/etcd/member/snap/db
+oc exec -n openshift-etcd $ETCD_POD -c etcd -- etcdctl endpoint status --write-out=table
+
+echo ""
+echo "========================================="
+echo "  Database Ready for Write Availability Testing!"
+echo "========================================="
+echo ""
+echo "Next: Run /tmp/etcd-continuous-writes.sh to test write availability"
+echo ""
+EOF
+
+chmod +x /tmp/create-large-etcd-db.sh
+```
+
+### Step 2: Create Continuous Write Test Script
+
+Create the script that continuously writes to etcd:
+
+```bash
+cat > /tmp/etcd-continuous-writes.sh << 'EOF'
+#!/bin/bash
+
+ETCD_POD=$(oc get pods -n openshift-etcd -l app=etcd -o name | head -1 | cut -d/ -f2)
 
 counter=0
 success=0
 failures=0
 
-echo "Starting continuous writes at $(date)"
+echo "Starting continuous etcd writes at $(date)"
+echo "Writing directly to etcd using etcdctl put..."
+echo ""
 
 while [ $counter -lt 1000 ]; do
   timestamp=$(date +%s%N)
-  
-  # Create a ConfigMap (uses etcd underneath)
-  if oc create configmap test-write-$timestamp \
-    --from-literal=key=value-$counter \
-    -n default \
-    --dry-run=client -o yaml | oc apply -f - >/dev/null 2>&1; then
-    
+
+  # Write directly to etcd (small value for speed)
+  if oc exec -n openshift-etcd $ETCD_POD -c etcd -- \
+    etcdctl put /test/write-test-$timestamp "value-$counter" \
+    >/dev/null 2>&1; then
+
     echo "$(date +'%H:%M:%S.%N') - Write $counter: SUCCESS"
     ((success++))
   else
     echo "$(date +'%H:%M:%S.%N') - Write $counter: BLOCKED/FAILED" >&2
     ((failures++))
   fi
-  
+
   ((counter++))
   sleep 0.1
 done
 
 echo ""
+echo "========================================="
+echo "  Continuous Write Test Results"
+echo "========================================="
 echo "Total writes: $counter"
 echo "Successful: $success"
 echo "Failed: $failures"
-echo "Success rate: $(awk "BEGIN {printf \"%.2f\", ($success/$counter)*100}")%"
+if [ $counter -gt 0 ]; then
+  success_rate=$(awk "BEGIN {printf \"%.2f\", ($success/$counter)*100}")
+  echo "Success rate: ${success_rate}%"
+fi
 EOF
 
-chmod +x /tmp/continuous-writes.sh
+chmod +x /tmp/etcd-continuous-writes.sh
+```
 
-# Run in background
-/tmp/continuous-writes.sh > /tmp/write-results.log 2>&1 &
+### Step 3: Run Database Setup
+
+Execute the setup script to create 3GB database:
+
+```bash
+/tmp/create-large-etcd-db.sh
+```
+
+**Important:** Note the "Defrag duration" from the output. This tells you how long the write availability test window will be.
+
+Example output:
+```
+Defrag duration: 25 seconds
+Expected write attempts during defrag: ~250
+```
+
+### Step 4: Test Write Availability During Defrag
+
+Now run the actual test with two terminals:
+
+#### Terminal 1: Start Continuous Writes
+
+```bash
+# Run continuous writes in background
+/tmp/etcd-continuous-writes.sh > /tmp/write-results.log 2>&1 &
 WRITE_PID=$!
 echo "Continuous writes started (PID: $WRITE_PID)"
+
+# Optional: Watch progress in real-time
+tail -f /tmp/write-results.log
 ```
 
-#### Terminal 2 - Monitor etcd Logs
+#### Terminal 2: Trigger Defrag (While Writes Are Running)
 
 ```bash
-# Watch etcd logs for defrag activity
-ETCD_POD=$(oc get pods -n openshift-etcd -l app=etcd -o name | head -1)
-
-oc logs -n openshift-etcd $ETCD_POD -c etcd --follow | grep -i "defrag"
-```
-
-#### Terminal 3 - Trigger Defrag
-
-```bash
-# Wait a bit for writes to start
+# Wait for writes to start
 sleep 5
 
 # Get etcd pod
@@ -146,16 +311,8 @@ ETCD_POD=$(oc get pods -n openshift-etcd -l app=etcd -o name | head -1 | cut -d/
 echo "Triggering defragmentation at: $(date +'%H:%M:%S')"
 DEFRAG_START=$(date +%s)
 
-# Execute defrag inside the etcd pod
-oc exec -n openshift-etcd $ETCD_POD -c etcd -- sh -c '
-  export ETCDCTL_API=3
-  export ETCDCTL_CACERT=/etc/kubernetes/static-pod-certs/configmaps/etcd-serving-ca/ca-bundle.crt
-  export ETCDCTL_CERT=/etc/kubernetes/static-pod-certs/secrets/etcd-all-certs/etcd-peer-${HOSTNAME}.crt
-  export ETCDCTL_KEY=/etc/kubernetes/static-pod-certs/secrets/etcd-all-certs/etcd-peer-${HOSTNAME}.key
-  export ETCDCTL_ENDPOINTS=https://localhost:2379
-  
-  etcdctl defrag
-'
+# Execute defrag (writes are happening in Terminal 1)
+oc exec -n openshift-etcd $ETCD_POD -c etcd -- etcdctl defrag
 
 DEFRAG_END=$(date +%s)
 DEFRAG_DURATION=$((DEFRAG_END - DEFRAG_START))
@@ -164,659 +321,158 @@ echo "Defragmentation completed at: $(date +'%H:%M:%S')"
 echo "Duration: ${DEFRAG_DURATION} seconds"
 ```
 
-#### Back in Terminal 1 - Analyze Results
+#### Terminal 1: Stop Writes and Analyze Results
 
 ```bash
-# Stop writes
+# Wait a few more seconds after defrag completes
+sleep 5
+
+# Stop continuous writes
+# If watching with tail -f, press Ctrl+C first, then:
 kill $WRITE_PID
 
 # Analyze results
-cat /tmp/write-results.log | tail -20
+echo ""
+echo "=== Write Availability Test Results ==="
 
-# Count failures
+# Count results
 TOTAL=$(grep -c "Write" /tmp/write-results.log)
-FAILURES=$(grep -c "BLOCKED/FAILED" /tmp/write-results.log || echo 0)
+FAILURES=$(grep -c "BLOCKED/FAILED" /tmp/write-results.log)
 SUCCESS=$((TOTAL - FAILURES))
 
-echo ""
-echo "=== Write Availability Analysis ==="
 echo "Total writes attempted: $TOTAL"
 echo "Successful: $SUCCESS"
 echo "Failed/Blocked: $FAILURES"
-echo "Success rate: $(awk "BEGIN {printf \"%.2f\", ($SUCCESS/$TOTAL)*100}")%"
 
-# Expected: >95% success rate with PR changes
-if [ $FAILURES -lt $((TOTAL / 20)) ]; then
-  echo "✓ SUCCESS: High write availability during defrag"
+if [ ${TOTAL:-0} -gt 0 ]; then
+  SUCCESS_RATE=$(awk "BEGIN {printf \"%.2f\", ($SUCCESS/$TOTAL)*100}")
+  echo "Success rate: ${SUCCESS_RATE}%"
+  
+  # Expected: >95% success rate with PR #378 changes
+  if [ $FAILURES -lt $((TOTAL / 20)) ]; then
+    echo ""
+    echo "✓ SUCCESS: High write availability during defrag (>95%)"
+    echo "  This indicates non-blocking defrag is working!"
+  else
+    echo ""
+    echo "⚠ WARNING: Significant write blocking detected"
+    echo "  PR #378 may not be deployed or database too small"
+  fi
 else
-  echo "⚠ WARNING: Significant write blocking detected"
+  echo "⚠ WARNING: No write data found in log file"
 fi
 
-# Cleanup test configmaps
-oc delete configmap -n default -l test-write 2>/dev/null
+# Show last few log entries
+echo ""
+echo "Last 10 write attempts:"
+tail -10 /tmp/write-results.log
 ```
 
 ---
 
-## Manual Test 2: Database Size Reduction
+## Cleanup
 
-### Objective
-Verify defragmentation reduces database size and reclaims space.
-
-### Expected Result
-- Database size decreases after defragmentation
-- Space is reclaimed from deleted/updated keys
-- Defrag completes successfully
-
-### Procedure
-
-#### Step 1: Check current database size (BEFORE)
-
-```bash
-# Get etcd pod
-ETCD_POD=$(oc get pods -n openshift-etcd -l app=etcd -o name | head -1 | cut -d/ -f2)
-
-# Check database size BEFORE defrag
-echo "=== Database Status BEFORE Defrag ==="
-
-oc exec -n openshift-etcd $ETCD_POD -c etcd -- sh -c '
-  export ETCDCTL_API=3
-  export ETCDCTL_CACERT=/etc/kubernetes/static-pod-certs/configmaps/etcd-serving-ca/ca-bundle.crt
-  export ETCDCTL_CERT=/etc/kubernetes/static-pod-certs/secrets/etcd-all-certs/etcd-peer-${HOSTNAME}.crt
-  export ETCDCTL_KEY=/etc/kubernetes/static-pod-certs/secrets/etcd-all-certs/etcd-peer-${HOSTNAME}.key
-  export ETCDCTL_ENDPOINTS=https://localhost:2379
-  
-  etcdctl endpoint status --write-out=table
-'
-
-# Save the size
-DB_SIZE_BEFORE=$(oc exec -n openshift-etcd $ETCD_POD -c etcd -- sh -c '
-  export ETCDCTL_API=3
-  export ETCDCTL_CACERT=/etc/kubernetes/static-pod-certs/configmaps/etcd-serving-ca/ca-bundle.crt
-  export ETCDCTL_CERT=/etc/kubernetes/static-pod-certs/secrets/etcd-all-certs/etcd-peer-${HOSTNAME}.crt
-  export ETCDCTL_KEY=/etc/kubernetes/static-pod-certs/secrets/etcd-all-certs/etcd-peer-${HOSTNAME}.key
-  export ETCDCTL_ENDPOINTS=https://localhost:2379
-  
-  etcdctl endpoint status --write-out=json
-' | grep -o '"dbSize":[0-9]*' | cut -d: -f2)
-
-echo "Database size: $DB_SIZE_BEFORE bytes ($(numfmt --to=iec $DB_SIZE_BEFORE))"
-```
-
-#### Step 2: Create fragmentation (optional)
-
-```bash
-# Create and delete some resources to cause fragmentation
-echo "Creating test resources..."
-for i in {1..100}; do
-  oc create configmap test-frag-$i --from-literal=data="$(head -c 10240 /dev/urandom | base64)" -n default
-done
-
-echo "Deleting half of them to create fragmentation..."
-for i in {1..50}; do
-  oc delete configmap test-frag-$i -n default
-done
-
-echo "Fragmentation created"
-sleep 5
-```
-
-#### Step 3: Perform defragmentation
-
-```bash
-echo "=== Triggering Defragmentation ==="
-
-oc exec -n openshift-etcd $ETCD_POD -c etcd -- sh -c '
-  export ETCDCTL_API=3
-  export ETCDCTL_CACERT=/etc/kubernetes/static-pod-certs/configmaps/etcd-serving-ca/ca-bundle.crt
-  export ETCDCTL_CERT=/etc/kubernetes/static-pod-certs/secrets/etcd-all-certs/etcd-peer-${HOSTNAME}.crt
-  export ETCDCTL_KEY=/etc/kubernetes/static-pod-certs/secrets/etcd-all-certs/etcd-peer-${HOSTNAME}.key
-  export ETCDCTL_ENDPOINTS=https://localhost:2379
-  
-  echo "Starting defrag..."
-  time etcdctl defrag
-  echo "Defrag completed"
-'
-```
-
-#### Step 4: Check database size (AFTER)
-
-```bash
-echo ""
-echo "=== Database Status AFTER Defrag ==="
-
-oc exec -n openshift-etcd $ETCD_POD -c etcd -- sh -c '
-  export ETCDCTL_API=3
-  export ETCDCTL_CACERT=/etc/kubernetes/static-pod-certs/configmaps/etcd-serving-ca/ca-bundle.crt
-  export ETCDCTL_CERT=/etc/kubernetes/static-pod-certs/secrets/etcd-all-certs/etcd-peer-${HOSTNAME}.crt
-  export ETCDCTL_KEY=/etc/kubernetes/static-pod-certs/secrets/etcd-all-certs/etcd-peer-${HOSTNAME}.key
-  export ETCDCTL_ENDPOINTS=https://localhost:2379
-  
-  etcdctl endpoint status --write-out=table
-'
-
-DB_SIZE_AFTER=$(oc exec -n openshift-etcd $ETCD_POD -c etcd -- sh -c '
-  export ETCDCTL_API=3
-  export ETCDCTL_CACERT=/etc/kubernetes/static-pod-certs/configmaps/etcd-serving-ca/ca-bundle.crt
-  export ETCDCTL_CERT=/etc/kubernetes/static-pod-certs/secrets/etcd-all-certs/etcd-peer-${HOSTNAME}.crt
-  export ETCDCTL_KEY=/etc/kubernetes/static-pod-certs/secrets/etcd-all-certs/etcd-peer-${HOSTNAME}.key
-  export ETCDCTL_ENDPOINTS=https://localhost:2379
-  
-  etcdctl endpoint status --write-out=json
-' | grep -o '"dbSize":[0-9]*' | cut -d: -f2)
-
-echo ""
-echo "=== Defrag Results ==="
-echo "Database size before: $DB_SIZE_BEFORE bytes ($(numfmt --to=iec $DB_SIZE_BEFORE))"
-echo "Database size after:  $DB_SIZE_AFTER bytes ($(numfmt --to=iec $DB_SIZE_AFTER))"
-echo "Space reclaimed: $((DB_SIZE_BEFORE - DB_SIZE_AFTER)) bytes ($(numfmt --to=iec $((DB_SIZE_BEFORE - DB_SIZE_AFTER))))"
-echo "Reduction: $(awk "BEGIN {printf \"%.2f\", (($DB_SIZE_BEFORE - $DB_SIZE_AFTER) / $DB_SIZE_BEFORE) * 100}")%"
-
-# Cleanup
-oc delete configmap -n default test-frag-{51..100} 2>/dev/null
-```
-
----
-
-## Manual Test 3: Data Consistency Verification
-
-### Objective
-Ensure no data loss occurs during defragmentation with concurrent writes.
-
-### Expected Result
-- All baseline data remains intact
-- All concurrent writes during defrag are persisted
-- Data checksums match before and after
-
-### Procedure
-
-#### Step 1: Create baseline dataset
-
-```bash
-echo "=== Creating Baseline Dataset ==="
-
-# Create known ConfigMaps
-for i in {1..50}; do
-  oc create configmap defrag-test-baseline-$i \
-    --from-literal=index=$i \
-    --from-literal=value="baseline-value-$i" \
-    -n default
-done
-
-# Store baseline checksum
-oc get configmap -n default -o json | \
-  jq -S '.items | map(select(.metadata.name | startswith("defrag-test-baseline"))) | sort_by(.metadata.name) | .[].data' > /tmp/baseline-data.json
-
-md5sum /tmp/baseline-data.json
-BASELINE_CHECKSUM=$(md5sum /tmp/baseline-data.json | cut -d' ' -f1)
-echo "Baseline checksum: $BASELINE_CHECKSUM"
-```
-
-#### Step 2: Start concurrent operations
-
-```bash
-# Start creating/updating resources during defrag
-cat > /tmp/concurrent-ops.sh << 'EOF'
-#!/bin/bash
-for i in {1..30}; do
-  oc create configmap defrag-test-concurrent-$i \
-    --from-literal=timestamp=$(date +%s) \
-    --from-literal=value="created-during-defrag-$i" \
-    -n default \
-    2>/dev/null || echo "Failed to create concurrent-$i"
-  sleep 0.2
-done
-echo "Concurrent operations completed"
-EOF
-
-chmod +x /tmp/concurrent-ops.sh
-
-# Start concurrent ops in background
-/tmp/concurrent-ops.sh &
-CONCURRENT_PID=$!
-
-# Let some operations start
-sleep 1
-```
-
-#### Step 3: Trigger defrag during concurrent operations
+After testing, remove all test data from etcd:
 
 ```bash
 ETCD_POD=$(oc get pods -n openshift-etcd -l app=etcd -o name | head -1 | cut -d/ -f2)
 
-echo "Triggering defrag with concurrent operations..."
+echo "=== Cleaning up test data from etcd ==="
 
-oc exec -n openshift-etcd $ETCD_POD -c etcd -- sh -c '
-  export ETCDCTL_API=3
-  export ETCDCTL_CACERT=/etc/kubernetes/static-pod-certs/configmaps/etcd-serving-ca/ca-bundle.crt
-  export ETCDCTL_CERT=/etc/kubernetes/static-pod-certs/secrets/etcd-all-certs/etcd-peer-${HOSTNAME}.crt
-  export ETCDCTL_KEY=/etc/kubernetes/static-pod-certs/secrets/etcd-all-certs/etcd-peer-${HOSTNAME}.key
-  export ETCDCTL_ENDPOINTS=https://localhost:2379
-  
-  etcdctl defrag
-'
+# Delete all keys under /test/ prefix
+oc exec -n openshift-etcd $ETCD_POD -c etcd -- etcdctl del /test/ --prefix
 
-# Wait for concurrent operations to finish
-wait $CONCURRENT_PID
-```
+echo "Test data deleted from etcd"
 
-#### Step 4: Verify data integrity
-
-```bash
-echo ""
-echo "=== Data Consistency Verification ==="
-
-# Check baseline data still exists
-echo "Checking baseline data..."
-MISSING_BASELINE=0
-for i in {1..50}; do
-  if ! oc get configmap defrag-test-baseline-$i -n default >/dev/null 2>&1; then
-    echo "Missing: defrag-test-baseline-$i"
-    ((MISSING_BASELINE++))
-  fi
-done
-
-echo "Missing baseline ConfigMaps: $MISSING_BASELINE"
-
-# Check concurrent data was persisted
-echo "Checking concurrent data..."
-MISSING_CONCURRENT=0
-for i in {1..30}; do
-  if ! oc get configmap defrag-test-concurrent-$i -n default >/dev/null 2>&1; then
-    echo "Missing: defrag-test-concurrent-$i"
-    ((MISSING_CONCURRENT++))
-  fi
-done
-
-echo "Missing concurrent ConfigMaps: $MISSING_CONCURRENT"
-
-# Verify baseline checksum (should be unchanged)
-oc get configmap -n default -o json | \
-  jq -S '.items | map(select(.metadata.name | startswith("defrag-test-baseline"))) | sort_by(.metadata.name) | .[].data' > /tmp/after-defrag-data.json
-
-AFTER_CHECKSUM=$(md5sum /tmp/after-defrag-data.json | cut -d' ' -f1)
+# Optionally defrag to reclaim space
+echo "Running defrag to reclaim space..."
+oc exec -n openshift-etcd $ETCD_POD -c etcd -- etcdctl defrag
 
 echo ""
-echo "Baseline checksum before: $BASELINE_CHECKSUM"
-echo "Baseline checksum after:  $AFTER_CHECKSUM"
+echo "Cleanup complete!"
+echo ""
 
-if [ "$BASELINE_CHECKSUM" = "$AFTER_CHECKSUM" ] && [ $MISSING_BASELINE -eq 0 ] && [ $MISSING_CONCURRENT -lt 5 ]; then
-  echo "✓ SUCCESS: Data consistency maintained during defrag"
-else
-  echo "✗ FAILURE: Data inconsistency detected"
-fi
-
-# Cleanup
-oc delete configmap -n default defrag-test-baseline-{1..50} 2>/dev/null
-oc delete configmap -n default defrag-test-concurrent-{1..30} 2>/dev/null
+# Verify cleanup
+echo "=== Final Database Size ==="
+oc exec -n openshift-etcd $ETCD_POD -c etcd -- ls -lh /var/lib/etcd/member/snap/db
 ```
 
 ---
 
-## Manual Test 4: Performance Impact Monitoring
+## Expected Results
 
-### Objective
-Observe cluster performance and API responsiveness during defragmentation.
+### With PR #378 (Non-Blocking Defrag)
 
-### Expected Result
-- Minimal API latency increase during defrag
-- No significant performance degradation
-- Cluster remains healthy throughout
+**Database:** ~3-4GB  
+**Defrag duration:** 10-30 seconds  
+**Write attempts:** 100-300  
+**Expected failures:** 0-5 writes (only during brief lock phases)  
+**Success rate:** **99%+** ✅
 
-### Procedure
+**Why:** The three-phase defrag keeps the database unlocked during the copy phase (Phase 2), which is the longest phase. Only brief locking during journal drain and switchover.
 
-#### Step 1: Monitor API server response times
+### Without PR #378 (Old Blocking Defrag)
 
-```bash
-# In one terminal, monitor API response times
-cat > /tmp/monitor-api.sh << 'EOF'
-#!/bin/bash
-echo "Monitoring API response times..."
-echo "Time,ResponseMS" > /tmp/api-response-times.csv
+**Database:** ~3-4GB  
+**Defrag duration:** 10-30 seconds  
+**Write attempts:** 100-300  
+**Expected failures:** 50-200 writes (blocked during entire copy)  
+**Success rate:** **50-80%** ❌
 
-while true; do
-  start=$(date +%s%N)
-  oc get nodes >/dev/null 2>&1
-  end=$(date +%s%N)
-  duration=$(( (end - start) / 1000000 ))  # Convert to milliseconds
-  
-  timestamp=$(date +'%H:%M:%S')
-  echo "$timestamp,$duration" >> /tmp/api-response-times.csv
-  echo "$timestamp - API response: ${duration}ms"
-  sleep 1
-done
-EOF
-
-chmod +x /tmp/monitor-api.sh
-/tmp/monitor-api.sh &
-API_MONITOR_PID=$!
-
-echo "API monitoring started (PID: $API_MONITOR_PID)"
-```
-
-#### Step 2: Check etcd metrics before defrag
-
-```bash
-ETCD_POD=$(oc get pods -n openshift-etcd -l app=etcd -o name | head -1 | cut -d/ -f2)
-
-echo "=== Etcd Metrics BEFORE Defrag ==="
-oc exec -n openshift-etcd $ETCD_POD -c etcd -- sh -c '
-  export ETCDCTL_API=3
-  export ETCDCTL_CACERT=/etc/kubernetes/static-pod-certs/configmaps/etcd-serving-ca/ca-bundle.crt
-  export ETCDCTL_CERT=/etc/kubernetes/static-pod-certs/secrets/etcd-all-certs/etcd-peer-${HOSTNAME}.crt
-  export ETCDCTL_KEY=/etc/kubernetes/static-pod-certs/secrets/etcd-all-certs/etcd-peer-${HOSTNAME}.key
-  export ETCDCTL_ENDPOINTS=https://localhost:2379
-  
-  echo "Endpoint health:"
-  etcdctl endpoint health
-  
-  echo ""
-  echo "Endpoint status:"
-  etcdctl endpoint status --write-out=table
-'
-```
-
-#### Step 3: Trigger defrag
-
-```bash
-echo ""
-echo "Triggering defrag at $(date)..."
-
-oc exec -n openshift-etcd $ETCD_POD -c etcd -- sh -c '
-  export ETCDCTL_API=3
-  export ETCDCTL_CACERT=/etc/kubernetes/static-pod-certs/configmaps/etcd-serving-ca/ca-bundle.crt
-  export ETCDCTL_CERT=/etc/kubernetes/static-pod-certs/secrets/etcd-all-certs/etcd-peer-${HOSTNAME}.crt
-  export ETCDCTL_KEY=/etc/kubernetes/static-pod-certs/secrets/etcd-all-certs/etcd-peer-${HOSTNAME}.key
-  export ETCDCTL_ENDPOINTS=https://localhost:2379
-  
-  time etcdctl defrag
-'
-
-echo "Defrag completed at $(date)"
-```
-
-#### Step 4: Check metrics after defrag
-
-```bash
-sleep 5
-
-echo ""
-echo "=== Etcd Metrics AFTER Defrag ==="
-oc exec -n openshift-etcd $ETCD_POD -c etcd -- sh -c '
-  export ETCDCTL_API=3
-  export ETCDCTL_CACERT=/etc/kubernetes/static-pod-certs/configmaps/etcd-serving-ca/ca-bundle.crt
-  export ETCDCTL_CERT=/etc/kubernetes/static-pod-certs/secrets/etcd-all-certs/etcd-peer-${HOSTNAME}.crt
-  export ETCDCTL_KEY=/etc/kubernetes/static-pod-certs/secrets/etcd-all-certs/etcd-peer-${HOSTNAME}.key
-  export ETCDCTL_ENDPOINTS=https://localhost:2379
-  
-  echo "Endpoint health:"
-  etcdctl endpoint health
-  
-  echo ""
-  echo "Endpoint status:"
-  etcdctl endpoint status --write-out=table
-'
-
-# Stop API monitoring
-kill $API_MONITOR_PID
-
-# Show API response time analysis
-echo ""
-echo "=== API Response Time Analysis ==="
-echo "Minimum: $(awk -F',' 'NR>1 {print $2}' /tmp/api-response-times.csv | sort -n | head -1)ms"
-echo "Maximum: $(awk -F',' 'NR>1 {print $2}' /tmp/api-response-times.csv | sort -n | tail -1)ms"
-echo "Average: $(awk -F',' 'NR>1 {sum+=$2; count++} END {printf "%.0f", sum/count}' /tmp/api-response-times.csv)ms"
-
-echo ""
-echo "Response times saved to: /tmp/api-response-times.csv"
-```
-
----
-
-## Manual Test 5: Journal Activity Logs
-
-### Objective
-Look for evidence of journal behavior and three-phase defragmentation in logs.
-
-### Expected Result
-- Log entries showing defrag phases
-- Journal operations being captured and replayed
-- No errors or panics during defrag
-
-### Procedure
-
-```bash
-ETCD_POD=$(oc get pods -n openshift-etcd -l app=etcd -o name | head -1 | cut -d/ -f2)
-
-echo "=== Searching for Journal/Defrag Activity in Logs ==="
-
-# Get recent logs before defrag
-echo "Logs before defrag:"
-oc logs -n openshift-etcd $ETCD_POD -c etcd --tail=100 | grep -i -E "defrag|journal" | tail -10
-
-# Trigger defrag
-echo ""
-echo "Triggering defrag..."
-oc exec -n openshift-etcd $ETCD_POD -c etcd -- sh -c '
-  export ETCDCTL_API=3
-  export ETCDCTL_CACERT=/etc/kubernetes/static-pod-certs/configmaps/etcd-serving-ca/ca-bundle.crt
-  export ETCDCTL_CERT=/etc/kubernetes/static-pod-certs/secrets/etcd-all-certs/etcd-peer-${HOSTNAME}.crt
-  export ETCDCTL_KEY=/etc/kubernetes/static-pod-certs/secrets/etcd-all-certs/etcd-peer-${HOSTNAME}.key
-  export ETCDCTL_ENDPOINTS=https://localhost:2379
-  
-  etcdctl defrag
-'
-
-sleep 2
-
-# Check logs after defrag
-echo ""
-echo "=== Defrag logs after operation ==="
-oc logs -n openshift-etcd $ETCD_POD -c etcd --tail=200 | grep -i -E "defrag|journal|phase|snapshot|switchover" | tail -30
-
-# Look for specific patterns
-echo ""
-echo "=== Searching for key patterns ==="
-echo "Phase 1 (snapshot):"
-oc logs -n openshift-etcd $ETCD_POD -c etcd --tail=200 | grep -i "snapshot" | tail -5
-
-echo ""
-echo "Phase 2 (journal/replay):"
-oc logs -n openshift-etcd $ETCD_POD -c etcd --tail=200 | grep -i "journal\|replay" | tail -5
-
-echo ""
-echo "Phase 3 (switchover):"
-oc logs -n openshift-etcd $ETCD_POD -c etcd --tail=200 | grep -i "switchover\|rename" | tail -5
-
-echo ""
-echo "Errors/Warnings:"
-oc logs -n openshift-etcd $ETCD_POD -c etcd --tail=200 | grep -i -E "error|warn|panic" | tail -5
-```
-
----
-
-## Quick Start: Simple Test
-
-If you just want a quick verification of basic defragmentation functionality:
-
-```bash
-#!/bin/bash
-
-# Get etcd pod
-ETCD_POD=$(oc get pods -n openshift-etcd -l app=etcd -o name | head -1 | cut -d/ -f2)
-
-echo "Running quick defrag test on pod: $ETCD_POD"
-echo ""
-
-# Run defrag with before/after status
-oc exec -n openshift-etcd $ETCD_POD -c etcd -- sh -c '
-  export ETCDCTL_API=3
-  export ETCDCTL_CACERT=/etc/kubernetes/static-pod-certs/configmaps/etcd-serving-ca/ca-bundle.crt
-  export ETCDCTL_CERT=/etc/kubernetes/static-pod-certs/secrets/etcd-all-certs/etcd-peer-${HOSTNAME}.crt
-  export ETCDCTL_KEY=/etc/kubernetes/static-pod-certs/secrets/etcd-all-certs/etcd-peer-${HOSTNAME}.key
-  export ETCDCTL_ENDPOINTS=https://localhost:2379
-  
-  echo "=== BEFORE DEFRAG ==="
-  etcdctl endpoint status --write-out=table
-  
-  echo ""
-  echo "=== RUNNING DEFRAG ==="
-  time etcdctl defrag
-  
-  echo ""
-  echo "=== AFTER DEFRAG ==="
-  etcdctl endpoint status --write-out=table
-'
-
-echo ""
-echo "Quick test completed!"
-```
-
-Save this as `/tmp/quick-defrag-test.sh` and run:
-```bash
-chmod +x /tmp/quick-defrag-test.sh
-/tmp/quick-defrag-test.sh
-```
-
----
-
-## Important Notes
-
-### ⚠️ Before Running Tests
-
-1. **Backup etcd** (if this is a critical cluster):
-   ```bash
-   ETCD_POD=$(oc get pods -n openshift-etcd -l app=etcd -o name | head -1 | cut -d/ -f2)
-   
-   # Take etcd backup
-   oc exec -n openshift-etcd $ETCD_POD -c etcd -- sh -c '
-     export ETCDCTL_API=3
-     export ETCDCTL_CACERT=/etc/kubernetes/static-pod-certs/configmaps/etcd-serving-ca/ca-bundle.crt
-     export ETCDCTL_CERT=/etc/kubernetes/static-pod-certs/secrets/etcd-all-certs/etcd-peer-${HOSTNAME}.crt
-     export ETCDCTL_KEY=/etc/kubernetes/static-pod-certs/secrets/etcd-all-certs/etcd-peer-${HOSTNAME}.key
-     export ETCDCTL_ENDPOINTS=https://localhost:2379
-     
-     etcdctl snapshot save /tmp/etcd-backup-$(date +%Y%m%d-%H%M%S).db
-   '
-   
-   # Copy backup out of pod
-   oc cp -n openshift-etcd $ETCD_POD:/tmp/etcd-backup-*.db /tmp/
-   ```
-
-2. **Verify PR changes are deployed**
-   - Check if your cluster's etcd image contains the PR #378 changes
-   - Look for the new journal implementation files
-   - Verify the three-phase defrag logic is present
-
-3. **Use test cluster preferably**
-   - Run on non-production clusters first
-   - Validate results before production deployment
-
-4. **Monitor cluster health**
-   - Watch for any alerts or degradation
-   - Check etcd member health throughout testing
-
-### Environment Variables Used
-
-All test scripts use the following etcd credentials (standard for OpenShift):
-- `ETCDCTL_API=3`
-- `ETCDCTL_CACERT=/etc/kubernetes/static-pod-certs/configmaps/etcd-serving-ca/ca-bundle.crt`
-- `ETCDCTL_CERT=/etc/kubernetes/static-pod-certs/secrets/etcd-all-certs/etcd-peer-${HOSTNAME}.crt`
-- `ETCDCTL_KEY=/etc/kubernetes/static-pod-certs/secrets/etcd-all-certs/etcd-peer-${HOSTNAME}.key`
-- `ETCDCTL_ENDPOINTS=https://localhost:2379`
-
-### Required Tools
-
-Ensure these tools are available:
-- `oc` - OpenShift CLI
-- `etcdctl` - etcd client (inside etcd pod)
-- `jq` - JSON processor (for some tests)
-- `numfmt` - Number formatter (optional, for human-readable sizes)
-
----
-
-## Summary Checklist
-
-After running the manual tests, verify these outcomes:
-
-### ✓ Test 1: Write Availability
-- [ ] Writes continue during defragmentation
-- [ ] Success rate > 95% (ideally >99%)
-- [ ] Only brief blocking observed during journal drain/switchover
-- [ ] Database size reduced after defrag
-
-### ✓ Test 2: Database Size Reduction
-- [ ] Database size shows reduction after defrag
-- [ ] Space is reclaimed from deleted/fragmented data
-- [ ] Defrag command completes successfully
-- [ ] No errors in etcd logs
-
-### ✓ Test 3: Data Consistency
-- [ ] All baseline keys intact after defrag
-- [ ] All concurrent writes preserved (or <5% lost during brief lock)
-- [ ] Data checksums match before/after for baseline data
-- [ ] No data corruption detected
-
-### ✓ Test 4: Performance Monitoring
-- [ ] API response times remain acceptable during defrag
-- [ ] No significant latency spikes observed
-- [ ] Cluster health checks pass throughout
-- [ ] etcd endpoint status shows healthy after defrag
-
-### ✓ Test 5: Journal Verification
-- [ ] Log entries show defrag activity
-- [ ] Evidence of journal operations (if PR changes present)
-- [ ] No panic or error messages during defrag
-- [ ] Three-phase behavior observable (if PR changes present)
-
----
-
-## Expected Results Summary
-
-### With PR #378 Changes (Non-Blocking Defrag)
-- **Write availability:** >99% during defrag
-- **Blocking time:** O(concurrent_writes) + O(1) for switchover
-- **Log evidence:** Journal snapshot, replay, and switchover phases
-- **Performance:** Minimal impact on API latency
-
-### Without PR #378 Changes (Baseline)
-- **Write availability:** Significantly lower, potential blocking
-- **Blocking time:** O(database_size) - entire copy phase blocks
-- **Log evidence:** Simple defrag operation
-- **Performance:** Noticeable API latency during defrag
+**Why:** The old approach locks the database for the entire duration of defragmentation, blocking all writes.
 
 ---
 
 ## Troubleshooting
 
-### Issue: Cannot exec into etcd pod
-**Solution:** Check RBAC permissions, ensure you're cluster-admin or have appropriate roles
+### Issue: "Argument list too long" Error
+
+**Cause:** Payload size too large for command-line argument  
+**Solution:** The script already uses stdin piping. If still failing, reduce `PAYLOAD_SIZE` to `262144` (256KB)
+
+### Issue: Defrag still only takes 300-500ms
+
+**Cause:** Database not large enough  
+**Solution:** 
+- Increase `NUM_KEYS` to 12000 or 20000
+- Or increase `PAYLOAD_SIZE` to 1048576 (1MB) and reduce `NUM_KEYS` to 5000
+
+### Issue: Cannot find etcd pod
+
+**Cause:** Different pod naming or not enough permissions  
+**Solution:**
+```bash
+# List all etcd pods
+oc get pods -n openshift-etcd
+
+# Use specific pod name
+ETCD_POD=etcd-<your-node-name>
+```
 
 ### Issue: etcdctl command not found
-**Solution:** etcdctl is inside the etcd container, use `oc exec ... -c etcd`
 
-### Issue: Permission denied on certificates
-**Solution:** Verify the certificate paths match your OpenShift version
-
-### Issue: Defrag takes too long
-**Solution:** Normal for large databases; with PR changes should not block writes
-
-### Issue: Write failures during test
-**Solution:** Expected during brief lock phases; >95% success rate is good
+**Cause:** etcdctl not in PATH inside pod  
+**Solution:** It should be available by default in OpenShift etcd pods. Verify:
+```bash
+oc exec -n openshift-etcd $ETCD_POD -c etcd -- which etcdctl
+```
 
 ---
 
-## Additional Resources
+## Summary Checklist
 
-- **PR #378:** https://github.com/openshift/etcd/pull/378
-- **etcd Defrag Documentation:** https://etcd.io/docs/latest/op-guide/maintenance/
-- **OpenShift etcd Operator:** https://docs.openshift.com/container-platform/latest/backup_and_restore/control_plane_backup_and_restore/backing-up-etcd.html
+After completing the test, verify:
+
+- [ ] Database created successfully (~3-4GB)
+- [ ] Defrag duration is 10-30 seconds (not milliseconds)
+- [ ] Continuous writes script ran during defrag
+- [ ] Write success rate measured
+- [ ] Success rate is >95% (indicates non-blocking defrag working)
+- [ ] Test data cleaned up from etcd
 
 ---
 
 ## Report Template
-
-After completing tests, document your findings:
 
 ```
 # etcd Defragmentation Test Report
@@ -828,45 +484,32 @@ After completing tests, document your findings:
 
 ## Test Results
 
-### Test 1: Write Availability
-- Total writes: XXX
-- Successful: XXX (XX%)
-- Failed: XXX (XX%)
-- Result: PASS/FAIL
+### Database Setup
+- Initial DB size: XXX MB
+- After adding data: XXX GB
+- After fragmentation: XXX GB
 
-### Test 2: Database Size
-- Size before: XXX MB
-- Size after: XXX MB
-- Reduction: XX%
-- Result: PASS/FAIL
+### Defrag Performance
+- Defrag duration: XX seconds
+- Database size after defrag: XXX GB
 
-### Test 3: Data Consistency
-- Baseline data: INTACT/CORRUPTED
-- Concurrent writes: XXX preserved
-- Checksums: MATCH/MISMATCH
-- Result: PASS/FAIL
+### Write Availability
+- Total write attempts: XXX
+- Successful writes: XXX
+- Failed writes: XXX
+- Success rate: XX.XX%
 
-### Test 4: Performance
-- Max API latency: XXX ms
-- Average latency: XXX ms
-- Cluster health: HEALTHY/DEGRADED
-- Result: PASS/FAIL
+### Conclusion
+- [ ] PASS: Success rate >95%
+- [ ] FAIL: Success rate <95%
 
-### Test 5: Logs
-- Journal activity: OBSERVED/NOT OBSERVED
-- Errors: YES/NO
-- Result: PASS/FAIL
-
-## Overall Assessment
-<Your summary here>
-
-## Recommendations
-<Your recommendations here>
+**Notes:**
+<Your observations here>
 ```
 
 ---
 
-**Document Version:** 1.0  
-**Created:** 2026-06-08  
-**Author:** Manual Testing Procedures for etcd PR #378  
+**Document Version:** 2.0 (Updated with direct etcdctl approach)  
+**Created:** 2026-06-09  
+**Testing Approach:** Direct etcd writes via etcdctl  
 **Target:** OpenShift etcd defragmentation verification
