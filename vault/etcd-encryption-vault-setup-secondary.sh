@@ -2,45 +2,6 @@
 set -euo pipefail
 
 # =========================================
-# USAGE
-# =========================================
-show_usage() {
-  cat << EOF
-Usage: $(basename "$0") [LABEL]
-
-Deploy Vault Enterprise instance with optional instance label for resource naming.
-
-Arguments:
-  LABEL     Optional label for this Vault instance (e.g., secondary, backup)
-            When specified: creates resources with "-{label}" suffix
-            When omitted: creates resources without suffix
-
-Examples:
-  # Default (no label):
-  bash etcd-encryption-vault-setup-secondary.sh
-  Creates: vault-0, vault-kms, kms-key, vault-ca-bundle, vault-approle-secret
-
-  # With "secondary" label:
-  bash etcd-encryption-vault-setup-secondary.sh secondary
-  Creates: vault-secondary-0, vault-kms-secondary, kms-key-secondary,
-           vault-ca-bundle-secondary, vault-approle-secret-secondary
-
-  # With "backup" label:
-  bash etcd-encryption-vault-setup-secondary.sh backup
-  Creates: vault-backup-0, vault-kms-backup, kms-key-backup,
-           vault-ca-bundle-backup, vault-approle-secret-backup
-
-Environment variables can still override settings (e.g., VAULT_VERSION, VAULT_NAMESPACE)
-EOF
-}
-
-# Parse command line arguments
-if [[ "${1:-}" == "-h" ]] || [[ "${1:-}" == "--help" ]]; then
-  show_usage
-  exit 0
-fi
-
-# =========================================
 # CONFIGURATION VARIABLES
 # =========================================
 # These can be overridden by environment variables
@@ -51,8 +12,25 @@ export VAULT_CHART_VERSION="${VAULT_CHART_VERSION:-0.28.1}"
 export VAULT_IMAGE_REPOSITORY="${VAULT_IMAGE_REPOSITORY:-docker.io/hashicorp/vault-enterprise}"
 
 # Vault instance label (used for resource naming, empty by default)
-# Accept from command line argument (position 1) or environment variable
-export VAULT_INSTANCE_LABEL="${1:-${VAULT_INSTANCE_LABEL:-}}"
+# When empty: creates resources without suffix (vault-0, vault-kms, vault-ca-bundle, etc.)
+# When set: adds "-{label}" suffix to all resources
+#
+# Usage examples:
+#   1. Default (no label):
+#      bash etcd-encryption-vault-setup-secondary.sh
+#      Creates: vault-0, vault-kms, kms-key, vault-ca-bundle, vault-approle-secret
+#
+#   2. With "secondary" label:
+#      VAULT_INSTANCE_LABEL=secondary bash etcd-encryption-vault-setup-secondary.sh
+#      Creates: vault-secondary-0, vault-kms-secondary, kms-key-secondary,
+#               vault-ca-bundle-secondary, vault-approle-secret-secondary
+#
+#   3. With "backup" label:
+#      VAULT_INSTANCE_LABEL=backup bash etcd-encryption-vault-setup-secondary.sh
+#      Creates: vault-backup-0, vault-kms-backup, kms-key-backup,
+#               vault-ca-bundle-backup, vault-approle-secret-backup
+#
+export VAULT_INSTANCE_LABEL="${VAULT_INSTANCE_LABEL:-}"
 
 # Build suffix from label (with hyphen if label is non-empty)
 LABEL_SUFFIX=""
@@ -294,6 +272,8 @@ echo "  - Transit Key: ${VAULT_KMS_KEY_NAME}"
 echo "  - Credentials Secret: vault-credentials"
 echo "  - ROLE_ID: ${ROLE_ID}"
 echo ""
+echo "Vault is now ready for KMS integration"
+echo ""
 
 # Create vault-approle-secret in openshift-config namespace
 echo "Creating vault-approle-secret${LABEL_SUFFIX} in openshift-config namespace..."
@@ -302,26 +282,4 @@ oc create secret generic "vault-approle-secret${LABEL_SUFFIX}" \
   --from-literal=role-id="${ROLE_ID}" \
   --from-literal=secret-id="${SECRET_ID}"
 echo "  ✓ vault-approle-secret${LABEL_SUFFIX} created in openshift-config"
-echo ""
-
-# =========================================
-# FINAL CONFIGURATION SUMMARY
-# =========================================
-
-# Retrieve Vault service cluster IP
-echo "Retrieving Vault service cluster IP..."
-VAULT_CLUSTER_IP=$(oc get svc "${VAULT_RELEASE_NAME}" -n "${VAULT_NAMESPACE}" -o jsonpath='{.spec.clusterIP}')
-VAULT_ADDRESS="https://${VAULT_CLUSTER_IP}:8200"
-
-echo "========================================="
-echo "Configuration Values for KMS plugin Integration"
-echo "========================================="
-echo ""
-echo "  transitKey:     ${VAULT_KMS_KEY_NAME}"
-echo "  approlesecret:  vault-approle-secret${LABEL_SUFFIX}"
-echo "  cabundle:       vault-ca-bundle${LABEL_SUFFIX}"
-echo "  serverName:     vault.${VAULT_NAMESPACE}.svc"
-echo "  vaultAddress:   ${VAULT_ADDRESS}"
-echo ""
-echo "========================================="
 echo ""
