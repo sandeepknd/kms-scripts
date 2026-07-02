@@ -239,3 +239,12 @@ echo "  - ROLE_ID: ${ROLE_ID}"
 echo ""
 echo "Vault is now ready for KMS integration"
 echo ""
+
+# Create vault-approle-secret in openshift-config namespace
+echo "Creating vault-approle-secret in openshift-config namespace..."
+oc create secret generic vault-approle-secret \
+  -n openshift-config \
+  --from-literal=role-id=$(oc get secret vault-credentials -n vault-kms -o jsonpath='{.data.role-id}' | base64 -d) \
+  --from-literal=secret-id=$(oc get secret vault-credentials -n vault-kms -o jsonpath='{.data.secret-id}' | base64 -d)
+echo "  ✓ vault-approle-secret created in openshift-config"
+echo ""
